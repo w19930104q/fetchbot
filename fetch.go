@@ -29,6 +29,11 @@ var (
 
 	// ErrQueueClosed is returned when a Send call is made on a closed Queue.
 	ErrQueueClosed = errors.New("fetchbot: send on a closed queue")
+
+	// ErrQueueFull is returned when a Send call is made on a Queue that has
+	// reached its MaxPending limit. The rejected command is neither requested
+	// nor passed to the Handler.
+	ErrQueueFull = errors.New("fetchbot: queue is full")
 )
 
 // Parse the robots.txt relative path a single time at startup, this can't
@@ -86,6 +91,18 @@ type Fetcher struct {
 	// duration.
 	AutoClose bool
 
+	// MaxPending limits the total number of unfinished commands across all hosts.
+	// A command is unfinished from the moment it is accepted by Queue.Send until
+	// its Handler returns (for any outcome, including request errors and robots.txt
+	// rejections), or until it is discarded by Cancel. Queued, in-flight and
+	// in-handler commands are all counted. Internal robots.txt requests do not
+	// count.
+	//
+	// When the limit is reached, Queue.Send returns ErrQueueFull immediately and
+	// the command is neither requested nor passed to the Handler. A value of zero
+	// (or less) means no limit, preserving the original behavior.
+	MaxPending int
+
 	// q holds the Queue to send data to the fetcher and optionally close (stop) it.
 	q *Queue
 	// dbg is a channel used to push debug information.
@@ -96,7 +113,7 @@ type Fetcher struct {
 	// hosts maps the host names to its dedicated requests channel, and mu protects
 	// concurrent access to the hosts field.
 	mu    sync.Mutex
-	hosts map[string]chan Command
+	hosts map[string]chan queueItem
 }
 
 // The DebugInfo holds information to introspect the Fetcher's state.
@@ -116,13 +133,35 @@ func New(h Handler) *Fetcher {
 	}
 }
 
+// queueItem is the internal type flowing through the queue and the per-host
+// pipelines. counted reports whether the command was admitted by Queue.Send and
+// thus holds one MaxPending slot until it completes or is discarded.
+type queueItem struct {
+	cmd     Command
+	counted bool
+}
+
 // Queue offers methods to send Commands to the Fetcher, and to Stop the crawling process.
 // It is safe to use from concurrent goroutines.
 type Queue struct {
-	ch chan Command
+	ch chan queueItem
 
 	// signal channels
 	closed, cancelled, done chan struct{}
+
+	// sendMu serializes Send's admission + enqueue with Close's close marker.
+	// It must never be held while finish (or anything that acquires mu) runs.
+	// Holding it across the q.ch send is safe because processQueue does not
+	// need sendMu to consume q.ch.
+	sendMu sync.Mutex
+
+	// mu protects pending only. It is never held while blocking on a channel.
+	mu         sync.Mutex
+	maxPending int
+	pending    int
+
+	closeOnce  sync.Once
+	cancelOnce sync.Once
 
 	wg sync.WaitGroup
 }
@@ -132,22 +171,24 @@ type Queue struct {
 // Attempts to enqueue new URLs after Close has been called will always result in
 // a ErrQueueClosed error.
 func (q *Queue) Close() error {
-	// Make sure it is not already closed, as this is a run-time panic
-	select {
-	case <-q.closed:
-		// Already closed, no-op
-		return nil
-	default:
-		// Close the signal-channel
+	q.closeOnce.Do(func() {
+		// Holding sendMu while enqueueing the close marker guarantees that every
+		// command admitted before this point is already ahead of the marker in
+		// q.ch, and will therefore be drained by processQueue. No other lock is
+		// held here, so a sender blocked on q.ch can always be unblocked by
+		// processQueue.
+		q.sendMu.Lock()
 		close(q.closed)
-		// Send a nil Command to make sure the processQueue method sees the close signal.
-		q.ch <- nil
-		// Wait for the Fetcher to drain.
+		q.ch <- queueItem{}
+		q.sendMu.Unlock()
+
+		// Wait for the queue processor and every host worker goroutine.
 		q.wg.Wait()
-		// Unblock any callers waiting on q.Block
+		// Unblock any callers waiting on q.Block / Done.
 		close(q.done)
-		return nil
-	}
+	})
+	<-q.done
+	return nil
 }
 
 // Block blocks the current goroutine until the Queue is closed and all pending
@@ -165,21 +206,20 @@ func (q *Queue) Done() <-chan struct{} {
 // Cancel closes the Queue and drains the pending commands without processing
 // them, allowing for a fast "stop immediately"-ish operation.
 func (q *Queue) Cancel() error {
-	select {
-	case <-q.cancelled:
-		// already cancelled, no-op
-		return nil
-	default:
+	q.cancelOnce.Do(func() {
 		// mark the queue as cancelled
 		close(q.cancelled)
-		// Close the Queue, that will wait for pending commands to drain
-		// will unblock any callers waiting on q.Block
-		return q.Close()
-	}
+	})
+	// Close the Queue, that will wait for pending commands to drain
+	// will unblock any callers waiting on q.Block
+	return q.Close()
 }
 
 // Send enqueues a Command into the Fetcher. If the Queue has been closed, it
-// returns ErrQueueClosed. The Command's URL must have a Host.
+// returns ErrQueueClosed. If Fetcher.MaxPending is reached, it returns
+// ErrQueueFull and the command is not enqueued. The Command's URL must have a Host.
+// A nil return value means the command has been admitted and will either be
+// processed (and its Handler called) or discarded by Cancel.
 func (q *Queue) Send(c Command) error {
 	if c == nil {
 		return ErrEmptyHost
@@ -187,13 +227,38 @@ func (q *Queue) Send(c Command) error {
 	if u := c.URL(); u == nil || u.Host == "" {
 		return ErrEmptyHost
 	}
+
+	q.sendMu.Lock()
+	defer q.sendMu.Unlock()
 	select {
 	case <-q.closed:
 		return ErrQueueClosed
 	default:
-		q.ch <- c
 	}
+	q.mu.Lock()
+	if q.maxPending > 0 && q.pending >= q.maxPending {
+		q.mu.Unlock()
+		return ErrQueueFull
+	}
+	// Incrementing pending and enqueueing while holding sendMu is what makes
+	// "Send returned nil" equivalent to "the command was admitted": Close
+	// cannot insert its close marker before an admitted command. The pending
+	// counter's mutex is released before the possibly-blocking channel send.
+	q.pending++
+	q.mu.Unlock()
+	q.ch <- queueItem{cmd: c, counted: true}
 	return nil
+}
+
+// finish releases one pending slot for an admitted command that reached a
+// terminal state (Handler returned) or was discarded by Cancel. It must be
+// called exactly once per counted queueItem.
+func (q *Queue) finish() {
+	q.mu.Lock()
+	if q.pending > 0 {
+		q.pending--
+	}
+	q.mu.Unlock()
 }
 
 // SendString enqueues a method and some URL strings into the Fetcher. It returns an error
@@ -235,13 +300,14 @@ func (q *Queue) sendWithMethod(method string, rawurl []string) (int, error) {
 
 // Start starts the Fetcher, and returns the Queue to use to send Commands to be fetched.
 func (f *Fetcher) Start() *Queue {
-	f.hosts = make(map[string]chan Command)
+	f.hosts = make(map[string]chan queueItem)
 
 	f.q = &Queue{
-		ch:        make(chan Command, 1),
-		closed:    make(chan struct{}),
-		cancelled: make(chan struct{}),
-		done:      make(chan struct{}),
+		ch:         make(chan queueItem, 1),
+		closed:     make(chan struct{}),
+		cancelled:  make(chan struct{}),
+		done:       make(chan struct{}),
+		maxPending: f.MaxPending,
 	}
 
 	// Start the one and only queue processing goroutine.
@@ -264,27 +330,24 @@ func (f *Fetcher) Debug() <-chan *DebugInfo {
 func (f *Fetcher) processQueue() {
 loop:
 	for v := range f.q.ch {
-		if v == nil {
-			// Special case, when the Queue is closed, a nil command is sent, use this
-			// indicator to check for the closed signal, instead of looking on every loop.
-			select {
-			case <-f.q.closed:
-				// Close signal, exit loop
-				break loop
-			default:
-				// Keep going
-			}
+		if v.cmd == nil {
+			// Close marker; Close only enqueues it after setting q.closed and
+			// after all previously admitted commands. Exit the loop.
+			break loop
 		}
 		select {
 		case <-f.q.cancelled:
-			// queue got cancelled, drain
+			// queue got cancelled, discard the command and release its slot.
+			if v.counted {
+				f.q.finish()
+			}
 			continue
 		default:
 			// go on
 		}
 
 		// Get the URL to enqueue
-		u := v.URL()
+		u := v.cmd.URL()
 
 		// Check if a channel is already started for this host
 		f.mu.Lock()
@@ -300,8 +363,8 @@ loop:
 
 			// Create the infinite queue: the in channel to send on, and the out channel
 			// to read from in the host's goroutine, and add to the hosts map
-			var out chan Command
-			in, out = make(chan Command, 1), make(chan Command, 1)
+			var out chan queueItem
+			in, out = make(chan queueItem, 1), make(chan queueItem, 1)
 			f.hosts[u.Host] = in
 			f.mu.Unlock()
 			f.q.wg.Add(1)
@@ -311,8 +374,9 @@ loop:
 			go f.processChan(out, u.Host)
 
 			if !f.DisablePoliteness {
-				// Enqueue the robots.txt request first.
-				in <- robotCommand{&Cmd{U: rob, M: "GET"}}
+				// Enqueue the robots.txt request first. It is not a business
+				// command, so it does not hold a MaxPending slot.
+				in <- queueItem{cmd: robotCommand{&Cmd{U: rob, M: "GET"}}}
 			}
 		} else {
 			f.mu.Unlock()
@@ -341,14 +405,14 @@ loop:
 	for _, ch := range f.hosts {
 		close(ch)
 	}
-	f.hosts = make(map[string]chan Command)
+	f.hosts = make(map[string]chan queueItem)
 	f.mu.Unlock()
 
 	f.q.wg.Done()
 }
 
 // Goroutine for a host's worker, processing requests for all its URLs.
-func (f *Fetcher) processChan(ch <-chan Command, hostKey string) {
+func (f *Fetcher) processChan(ch <-chan queueItem, hostKey string) {
 	var (
 		agent *robotstxt.Group
 		wait  <-chan time.Time
@@ -375,12 +439,16 @@ loop:
 			// was it cancelled during the wait? check again
 			select {
 			case <-f.q.cancelled:
+				// We already removed v from ch; discard it and release its slot.
+				if v.counted {
+					f.q.finish()
+				}
 				break loop
 			default:
 				// go on
 			}
 
-			switch r, ok := v.(robotCommand); {
+			switch r, ok := v.cmd.(robotCommand); {
 			case ok:
 				// This is the robots.txt request
 				agent = f.getRobotAgent(r)
@@ -390,10 +458,15 @@ loop:
 				}
 				wait = time.After(delay)
 
-			case agent == nil || agent.Test(v.URL().Path):
+			case agent == nil || agent.Test(v.cmd.URL().Path):
 				// Path allowed, process the request
-				res, err := f.doRequest(v)
-				f.visit(v, res, err)
+				res, err := f.doRequest(v.cmd)
+				f.visit(v.cmd, res, err)
+				// The command is done (success or request error); release its
+				// slot only now that the Handler has returned.
+				if v.counted {
+					f.q.finish()
+				}
 				// No delay on error - the remote host was not reached
 				if err == nil {
 					wait = time.After(delay)
@@ -403,7 +476,11 @@ loop:
 
 			default:
 				// Path disallowed by robots.txt
-				f.visit(v, nil, ErrDisallowed)
+				f.visit(v.cmd, nil, ErrDisallowed)
+				// Release only after the Handler returned.
+				if v.counted {
+					f.q.finish()
+				}
 				wait = nil
 			}
 			// Every time a command is received, reset the ttl channel
@@ -428,8 +505,12 @@ loop:
 	}
 
 	// need to drain ch until it is closed, to prevent the producer goroutine
-	// from leaking.
-	for _ = range ch {
+	// from leaking. Any commands discarded here (due to Close/Cancel) release
+	// their MaxPending slots.
+	for v := range ch {
+		if v.counted {
+			f.q.finish()
+		}
 	}
 
 	f.q.wg.Done()

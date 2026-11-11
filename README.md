@@ -19,6 +19,7 @@ The [API documentation is available on godoc.org](http://godoc.org/github.com/Pu
 
 ## Changes
 
+* Add `Fetcher.MaxPending` to cap the number of unfinished commands across all hosts. Zero keeps the previous unlimited behavior; when the cap is reached, `Queue.Send` returns `ErrQueueFull` without requesting or handling the rejected command. `SendString` helpers report the admitted prefix length and the first error.
 * 2019-09-11 (v1.2.0): update robotstxt dependency (import path/repo URL has changed, issue #31, thanks to [@michael-stevens][michael-stevens] for raising the issue).
 * 2017-09-04 (v1.1.1): fix a goroutine leak when cancelling a Queue (issue #26, thanks to [@ryu-koui][ryu] for raising the issue).
 * 2017-07-06 (v1.1.0): add `Queue.Done` to get the done channel on the queue, allowing to wait in a `select` statement (thanks to [@DennisDenuto][denuto]).
@@ -149,6 +150,14 @@ against the robots.txt entries.
 new commands to fetch. If the idle time-to-live is reached, the worker goroutine
 is stopped and its resources are released. This can be especially useful for
 long-running crawlers.
+
+* MaxPending : Limits the total number of unfinished commands across all hosts.
+A command is unfinished from the moment `Queue.Send` accepts it until its Handler
+returns (whether the request succeeded, failed, or was rejected by robots.txt),
+or until `Cancel` discards it. Queued, in-flight and in-handler commands are all
+counted; the internal robots.txt requests are not. When the limit is reached,
+`Queue.Send` returns `ErrQueueFull` immediately, and the rejected command is neither
+requested nor passed to the Handler. The zero value means no limit.
 
 * AutoClose : If true, closes the queue automatically once the number of active hosts
 reach 0.

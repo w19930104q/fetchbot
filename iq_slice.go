@@ -25,11 +25,11 @@ package fetchbot
 // sliceIQ creates an infinite buffered channel taking input on
 // in and sending output to next.  SliceIQ should be run in its
 // own goroutine.
-func sliceIQ(in <-chan Command, next chan<- Command) {
+func sliceIQ(in <-chan queueItem, next chan<- queueItem) {
 	defer close(next)
 
 	// pending events (this is the "infinite" part)
-	pending := []Command{}
+	pending := []queueItem{}
 
 recv:
 	for {
@@ -57,7 +57,7 @@ recv:
 
 		// Send queued values
 		case next <- pending[0]:
-			pending[0] = nil
+			pending[0] = queueItem{}
 			pending = pending[1:]
 		}
 	}
