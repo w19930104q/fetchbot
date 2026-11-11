@@ -19,6 +19,7 @@ The [API documentation is available on godoc.org](http://godoc.org/github.com/Pu
 
 ## Changes
 
+* 2026-11-11 : add `MaxPending` field on the `Fetcher` to limit the total number of pending commands across all hosts (queued, in-flight or running their `Handler`). When the limit is reached, `Send` fails immediately with the new `ErrQueueFull` error and the command is neither requested nor passed to the `Handler`. A command holds its slot until its `Handler` call returns (or until it is discarded by a `Cancel`); the internal robots.txt requests do not count towards the limit. The default value of 0 keeps the previous unlimited behavior.
 * 2019-09-11 (v1.2.0): update robotstxt dependency (import path/repo URL has changed, issue #31, thanks to [@michael-stevens][michael-stevens] for raising the issue).
 * 2017-09-04 (v1.1.1): fix a goroutine leak when cancelling a Queue (issue #26, thanks to [@ryu-koui][ryu] for raising the issue).
 * 2017-07-06 (v1.1.0): add `Queue.Done` to get the done channel on the queue, allowing to wait in a `select` statement (thanks to [@DennisDenuto][denuto]).
